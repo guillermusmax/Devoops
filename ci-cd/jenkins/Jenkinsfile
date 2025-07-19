@@ -1,0 +1,432 @@
+# 🥤 NovaLat - Pipeline de Jenkins
+# CI/CD para sistema de trazabilidad alimentaria
+
+pipeline {
+    agent any
+    
+    environment {
+        // Variables de entorno
+        DOCKER_IMAGE = 'novalat-traceability'
+        DOCKER_TAG = "${env.BUILD_NUMBER}"
+        REGISTRY_URL = 'novalatdevacr.azurecr.io'
+        KUBERNETES_NAMESPACE = 'novalat'
+        
+        // Azure
+        AZURE_SUBSCRIPTION_ID = credentials('azure-subscription-id')
+        AZURE_TENANT_ID = credentials('azure-tenant-id')
+        AZURE_CLIENT_ID = credentials('azure-client-id')
+        AZURE_CLIENT_SECRET = credentials('azure-client-secret')
+        
+        // Base de datos
+        DATABASE_URL = credentials('database-url')
+        REDIS_URL = credentials('redis-url')
+        
+        // JWT
+        JWT_SECRET_KEY = credentials('jwt-secret-key')
+        
+        // Slack
+        SLACK_CHANNEL = '#novalat-devops'
+    }
+    
+    options {
+        // Opciones del pipeline
+        timeout(time: 30, unit: 'MINUTES')
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+    }
+    
+    triggers {
+        // Triggers automáticos
+        pollSCM('H/5 * * * *')  // Poll cada 5 minutos
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                script {
+                    // Limpiar workspace
+                    cleanWs()
+                    
+                    // Checkout del código
+                    checkout scm
+                    
+                    // Notificar inicio
+                    notifySlack('STARTED', 'Pipeline iniciado')
+                }
+            }
+        }
+        
+        stage('Code Quality') {
+            parallel {
+                stage('Lint Python') {
+                    steps {
+                        script {
+                            sh '''
+                                echo "🔍 Ejecutando linting de Python..."
+                                pip install flake8 black isort mypy
+                                
+                                # Black - formateo de código
+                                black --check --diff src/
+                                
+                                # isort - ordenamiento de imports
+                                isort --check-only --diff src/
+                                
+                                # flake8 - linting
+                                flake8 src/ --max-line-length=88 --extend-ignore=E203,W503
+                                
+                                # mypy - type checking
+                                mypy src/ --ignore-missing-imports
+                            '''
+                        }
+                    }
+                }
+                
+                stage('Security Scan') {
+                    steps {
+                        script {
+                            sh '''
+                                echo "🔒 Ejecutando escaneo de seguridad..."
+                                pip install bandit safety
+                                
+                                # Bandit - análisis de seguridad
+                                bandit -r src/ -f json -o bandit-report.json || true
+                                
+                                # Safety - verificación de dependencias
+                                safety check --json --output safety-report.json || true
+                                
+                                # Análisis de vulnerabilidades en Docker
+                                docker run --rm -v $(pwd):/app aquasec/trivy fs /app
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Unit Tests') {
+            steps {
+                script {
+                    sh '''
+                        echo "🧪 Ejecutando pruebas unitarias..."
+                        pip install -r requirements.txt
+                        
+                        # Ejecutar pruebas con cobertura
+                        pytest src/tests/ \
+                            --cov=src \
+                            --cov-report=xml \
+                            --cov-report=html \
+                            --cov-report=term-missing \
+                            --junitxml=test-results.xml \
+                            -v
+                    '''
+                }
+            }
+            post {
+                always {
+                    // Publicar reportes
+                    publishHTML([
+                        allowMissing: false,
+                        alwaysLinkToLastBuild: true,
+                        keepAll: true,
+                        reportDir: 'htmlcov',
+                        reportFiles: 'index.html',
+                        reportName: 'Coverage Report'
+                    ])
+                    
+                    publishTestResults testResultsPattern: 'test-results.xml'
+                }
+            }
+        }
+        
+        stage('Integration Tests') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch 'develop'
+                }
+            }
+            steps {
+                script {
+                    sh '''
+                        echo "🔗 Ejecutando pruebas de integración..."
+                        
+                        # Iniciar servicios de prueba
+                        docker-compose -f docker-compose.test.yml up -d
+                        
+                        # Esperar que los servicios estén listos
+                        sleep 30
+                        
+                        # Ejecutar pruebas de integración
+                        pytest src/tests/integration/ \
+                            --junitxml=integration-test-results.xml \
+                            -v
+                    '''
+                }
+            }
+            post {
+                always {
+                    // Limpiar servicios de prueba
+                    sh 'docker-compose -f docker-compose.test.yml down -v'
+                    publishTestResults testResultsPattern: 'integration-test-results.xml'
+                }
+            }
+        }
+        
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    sh '''
+                        echo "🐳 Construyendo imagen Docker..."
+                        
+                        # Login a Azure Container Registry
+                        az acr login --name ${REGISTRY_URL}
+                        
+                        # Construir imagen
+                        docker build -t ${REGISTRY_URL}/${DOCKER_IMAGE}:${DOCKER_TAG} .
+                        docker build -t ${REGISTRY_URL}/${DOCKER_IMAGE}:latest .
+                        
+                        # Etiquetar con commit hash
+                        docker tag ${REGISTRY_URL}/${DOCKER_IMAGE}:${DOCKER_TAG} \
+                            ${REGISTRY_URL}/${DOCKER_IMAGE}:${GIT_COMMIT}
+                    '''
+                }
+            }
+        }
+        
+        stage('Push to Registry') {
+            steps {
+                script {
+                    sh '''
+                        echo "📤 Subiendo imagen al registro..."
+                        
+                        # Push de imágenes
+                        docker push ${REGISTRY_URL}/${DOCKER_IMAGE}:${DOCKER_TAG}
+                        docker push ${REGISTRY_URL}/${DOCKER_IMAGE}:latest
+                        docker push ${REGISTRY_URL}/${DOCKER_IMAGE}:${GIT_COMMIT}
+                    '''
+                }
+            }
+        }
+        
+        stage('Deploy to Staging') {
+            when {
+                anyOf {
+                    branch 'develop'
+                    branch 'main'
+                }
+            }
+            steps {
+                script {
+                    sh '''
+                        echo "🚀 Desplegando en staging..."
+                        
+                        # Configurar kubectl
+                        az aks get-credentials --resource-group novalat-dev-rg --name novalat-dev-aks
+                        
+                        # Aplicar configuración de Kubernetes
+                        kubectl apply -f k8s/namespace.yaml
+                        kubectl apply -f k8s/configmap.yaml
+                        kubectl apply -f k8s/secrets.yaml
+                        
+                        # Desplegar aplicación
+                        envsubst < k8s/deployment.yaml | kubectl apply -f -
+                        kubectl apply -f k8s/service.yaml
+                        kubectl apply -f k8s/ingress.yaml
+                        
+                        # Esperar que el deployment esté listo
+                        kubectl rollout status deployment/novalat-api -n ${KUBERNETES_NAMESPACE}
+                    '''
+                }
+            }
+        }
+        
+        stage('Integration Tests (Staging)') {
+            when {
+                branch 'develop'
+            }
+            steps {
+                script {
+                    sh '''
+                        echo "🔗 Ejecutando pruebas de integración en staging..."
+                        
+                        # Obtener URL del servicio
+                        STAGING_URL=$(kubectl get service novalat-api -n ${KUBERNETES_NAMESPACE} -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+                        
+                        # Ejecutar pruebas de integración contra staging
+                        STAGING_URL=http://${STAGING_URL} pytest src/tests/staging/ \
+                            --junitxml=staging-test-results.xml \
+                            -v
+                    '''
+                }
+            }
+            post {
+                always {
+                    publishTestResults testResultsPattern: 'staging-test-results.xml'
+                }
+            }
+        }
+        
+        stage('Deploy to Production') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    sh '''
+                        echo "🚀 Desplegando en producción..."
+                        
+                        // Confirmación manual para producción
+                        input message: '¿Confirmar despliegue en producción?'
+                        
+                        # Configurar kubectl para producción
+                        az aks get-credentials --resource-group novalat-prod-rg --name novalat-prod-aks
+                        
+                        # Aplicar configuración de Kubernetes
+                        kubectl apply -f k8s/namespace.yaml
+                        kubectl apply -f k8s/configmap.yaml
+                        kubectl apply -f k8s/secrets.yaml
+                        
+                        # Desplegar aplicación
+                        envsubst < k8s/deployment.yaml | kubectl apply -f -
+                        kubectl apply -f k8s/service.yaml
+                        kubectl apply -f k8s/ingress.yaml
+                        
+                        # Esperar que el deployment esté listo
+                        kubectl rollout status deployment/novalat-api -n ${KUBERNETES_NAMESPACE}
+                        
+                        # Verificar salud del servicio
+                        sleep 30
+                        curl -f http://${PRODUCTION_URL}/health
+                    '''
+                }
+            }
+        }
+        
+        stage('Performance Tests') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    sh '''
+                        echo "⚡ Ejecutando pruebas de rendimiento..."
+                        
+                        # Instalar Locust
+                        pip install locust
+                        
+                        # Ejecutar pruebas de carga
+                        locust -f src/tests/load/locustfile.py \
+                            --host=http://${PRODUCTION_URL} \
+                            --users=100 \
+                            --spawn-rate=10 \
+                            --run-time=5m \
+                            --headless \
+                            --html=performance-report.html
+                    '''
+                }
+            }
+            post {
+                always {
+                    publishHTML([
+                        allowMissing: false,
+                        alwaysLinkToLastBuild: true,
+                        keepAll: true,
+                        reportDir: '.',
+                        reportFiles: 'performance-report.html',
+                        reportName: 'Performance Report'
+                    ])
+                }
+            }
+        }
+        
+        stage('Infrastructure Update') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    sh '''
+                        echo "🏗️ Actualizando infraestructura..."
+                        
+                        # Login a Azure
+                        az login --service-principal \
+                            -u ${AZURE_CLIENT_ID} \
+                            -p ${AZURE_CLIENT_SECRET} \
+                            --tenant ${AZURE_TENANT_ID}
+                        
+                        az account set --subscription ${AZURE_SUBSCRIPTION_ID}
+                        
+                        # Aplicar Terraform
+                        cd iac/terraform
+                        terraform init
+                        terraform plan -out=tfplan
+                        terraform apply tfplan
+                    '''
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            script {
+                // Limpiar imágenes Docker
+                sh '''
+                    docker system prune -f
+                    docker image prune -f
+                '''
+                
+                // Notificar resultado
+                if (currentBuild.result == 'SUCCESS') {
+                    notifySlack('SUCCESS', 'Pipeline completado exitosamente')
+                } else {
+                    notifySlack('FAILURE', 'Pipeline falló')
+                }
+            }
+        }
+        
+        success {
+            script {
+                // Crear release en GitHub
+                if (env.BRANCH_NAME == 'main') {
+                    sh '''
+                        # Crear tag
+                        git tag -a v${BUILD_NUMBER} -m "Release ${BUILD_NUMBER}"
+                        git push origin v${BUILD_NUMBER}
+                        
+                        # Crear release en GitHub
+                        gh release create v${BUILD_NUMBER} \
+                            --title "Release ${BUILD_NUMBER}" \
+                            --notes "Automated release from Jenkins pipeline"
+                    '''
+                }
+            }
+        }
+        
+        failure {
+            script {
+                // Rollback en caso de fallo
+                if (env.BRANCH_NAME == 'main') {
+                    sh '''
+                        echo "🔄 Ejecutando rollback..."
+                        kubectl rollout undo deployment/novalat-api -n ${KUBERNETES_NAMESPACE}
+                    '''
+                }
+            }
+        }
+    }
+}
+
+// Función para notificar a Slack
+def notifySlack(String buildStatus, String message) {
+    def color = buildStatus == 'STARTED' ? 'warning' : 
+                buildStatus == 'SUCCESS' ? 'good' : 'danger'
+    
+    slackSend(
+        channel: env.SLACK_CHANNEL,
+        color: color,
+        message: "${message} - Build #${env.BUILD_NUMBER} (${env.BRANCH_NAME})",
+        title: "NovaLat CI/CD Pipeline",
+        titleLink: env.BUILD_URL
+    )
+} 
